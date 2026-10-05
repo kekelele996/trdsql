@@ -6,6 +6,8 @@ package trdsql
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 )
@@ -181,6 +183,18 @@ func (trd *TRDSQL) ExecContext(ctx context.Context, sqlQuery string) error {
 		return fmt.Errorf("begin: %w", err)
 	}
 
+	// Any failure before commit rolls back the transaction,
+	// discarding tables created and rows inserted during this run
+	// so no partial results are left behind.
+	committed := false
+	defer func() {
+		if !committed {
+			if rerr := db.Tx.Rollback(); rerr != nil && !errors.Is(rerr, sql.ErrTxDone) {
+				log.Printf("rollback: %s", rerr)
+			}
+		}
+	}()
+
 	if trd.Importer != nil {
 		sqlQuery, err = trd.Importer.ImportContext(ctx, db, sqlQuery)
 		if err != nil {
@@ -197,6 +211,7 @@ func (trd *TRDSQL) ExecContext(ctx context.Context, sqlQuery string) error {
 	if err := db.Tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
+	committed = true
 
 	return nil
 }

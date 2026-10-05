@@ -1,10 +1,14 @@
 package trdsql
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -448,5 +452,232 @@ func Test_uncompressedReader(t *testing.T) {
 				t.Errorf("extFileReader() = %v, want %v", string(r)[0:7], tt.want[0:7])
 			}
 		})
+	}
+}
+
+func writeTestFile(t *testing.T, name string, content []byte) {
+	t.Helper()
+	if err := os.WriteFile(name, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// corruptGzip has a valid gzip magic number and fixed header,
+// but a garbage (non-deflate) body.
+var corruptGzip = []byte{
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+	'c', 'o', 'r', 'r', 'u', 'p', 't', '!', '!', '!',
+}
+
+func TestGlobFileOpen_StableOrder(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "a.csv"), []byte("1,one"))
+	writeTestFile(t, filepath.Join(dir, "b.csv"), []byte("2,two"))
+	writeTestFile(t, filepath.Join(dir, "c.csv"), []byte("3,three"))
+
+	r, err := globFileOpen(filepath.Join(dir, "*.csv"))
+	if err != nil {
+		t.Fatalf("globFileOpen() error = %v", err)
+	}
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read error = %v", err)
+	}
+	want := "1,one\n2,two\n3,three\n"
+	if string(got) != want {
+		t.Errorf("globFileOpen() = %q, want %q", got, want)
+	}
+}
+
+func TestGlobFileOpen_UnreadablePreflight(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can open files regardless of permission bits")
+	}
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "good1.csv"), []byte("1,one\n"))
+	noPerm := filepath.Join(dir, "noperm.csv")
+	writeTestFile(t, noPerm, []byte("2,two\n"))
+	if err := os.Chmod(noPerm, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(noPerm, 0o644) })
+
+	_, err := globFileOpen(filepath.Join(dir, "*.csv"))
+	if err == nil {
+		t.Fatal("expected error for unreadable file, got nil")
+	}
+	if !errors.Is(err, ErrBatchInput) {
+		t.Errorf("error = %v, want errors.Is ErrBatchInput", err)
+	}
+	if !strings.Contains(err.Error(), "noperm.csv") {
+		t.Errorf("error %q does not name the offending file", err)
+	}
+}
+
+func TestGlobFileOpen_DirectoryMatched(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "good.csv"), []byte("1,one\n"))
+	if err := os.Mkdir(filepath.Join(dir, "subdir.csv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := globFileOpen(filepath.Join(dir, "*.csv"))
+	if err == nil {
+		t.Fatal("expected error for matched directory, got nil")
+	}
+	if !errors.Is(err, ErrBatchInput) {
+		t.Errorf("error = %v, want errors.Is ErrBatchInput", err)
+	}
+	if !strings.Contains(err.Error(), "subdir.csv") {
+		t.Errorf("error %q does not name the offending entry", err)
+	}
+}
+
+func TestGlobFileOpen_CorruptCompressed(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "good1.csv"), []byte("1,one\n"))
+	writeTestFile(t, filepath.Join(dir, "good2.csv"), []byte("2,two\n"))
+	writeTestFile(t, filepath.Join(dir, "zcorrupt.csv.gz"), corruptGzip)
+
+	r, err := globFileOpen(filepath.Join(dir, "*.csv*"))
+	if err != nil {
+		t.Fatalf("preflight should pass, got %v", err)
+	}
+	_, rerr := io.ReadAll(r)
+	if rerr == nil {
+		t.Fatal("expected read error for corrupt gzip, got nil")
+	}
+	if !errors.Is(rerr, ErrBatchInput) {
+		t.Errorf("error = %v, want errors.Is ErrBatchInput", rerr)
+	}
+	if !strings.Contains(rerr.Error(), "zcorrupt.csv.gz") {
+		t.Errorf("error %q does not name the corrupt file", rerr)
+	}
+}
+
+func TestExec_BatchFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits")
+	}
+	tests := []struct {
+		name       string
+		setup      func(t *testing.T, dir string)
+		reportFile string
+	}{
+		{
+			name: "permissionDenied",
+			setup: func(t *testing.T, dir string) {
+				writeTestFile(t, filepath.Join(dir, "good1.csv"), []byte("1,one\n"))
+				writeTestFile(t, filepath.Join(dir, "good2.csv"), []byte("2,two\n"))
+				noPerm := filepath.Join(dir, "noperm.csv")
+				writeTestFile(t, noPerm, []byte("3,three\n"))
+				if err := os.Chmod(noPerm, 0o000); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(noPerm, 0o644) })
+			},
+			reportFile: "noperm.csv",
+		},
+		{
+			name: "corruptGzip",
+			setup: func(t *testing.T, dir string) {
+				writeTestFile(t, filepath.Join(dir, "good1.csv"), []byte("1,one\n"))
+				writeTestFile(t, filepath.Join(dir, "good2.csv"), []byte("2,two\n"))
+				writeTestFile(t, filepath.Join(dir, "zcorrupt.csv.gz"), corruptGzip)
+			},
+			reportFile: "zcorrupt.csv.gz",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tt.setup(t, dir)
+
+			outStream := new(bytes.Buffer)
+			trd := setDefaultTRDSQL(outStream)
+			glob := filepath.Join(dir, "*.csv*")
+			err := trd.Exec("SELECT * FROM " + glob)
+			if err == nil {
+				t.Fatal("expected Exec error, got nil")
+			}
+			if !errors.Is(err, ErrBatchInput) {
+				t.Errorf("Exec error = %v, want errors.Is ErrBatchInput", err)
+			}
+			if !strings.Contains(err.Error(), tt.reportFile) {
+				t.Errorf("error %q does not name %s", err, tt.reportFile)
+			}
+			if outStream.Len() != 0 {
+				t.Errorf("partial results were output: %q", outStream.String())
+			}
+		})
+	}
+}
+
+// TestGlobImport_RollbackRemovesTable verifies that when a batch fails
+// after the temporary table has been created and rows inserted,
+// rolling back the transaction leaves no table behind.
+func TestGlobImport_RollbackRemovesTable(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "good1.csv"), []byte("1,one"))
+	writeTestFile(t, filepath.Join(dir, "good2.csv"), []byte("2,two"))
+	writeTestFile(t, filepath.Join(dir, "zcorrupt.csv.gz"), corruptGzip)
+
+	dbFile := filepath.Join(t.TempDir(), "trdsql.db")
+	db, err := Connect(DefaultDriver, dbFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep every transaction on the same connection so that
+	// sqlite_temp_master state is observable below.
+	db.SetMaxOpenConns(1)
+
+	glob := filepath.Join(dir, "*.csv*")
+
+	db.Tx, err = db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	importer := NewImporter()
+	_, err = importer.ImportContext(context.Background(), db, "SELECT * FROM "+glob)
+	if err == nil {
+		t.Fatal("expected import error, got nil")
+	}
+	if !errors.Is(err, ErrBatchInput) {
+		t.Errorf("import error = %v, want errors.Is ErrBatchInput", err)
+	}
+	if !strings.Contains(err.Error(), "zcorrupt.csv.gz") {
+		t.Errorf("error %q does not name the corrupt file", err)
+	}
+	if err := db.Tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %s", err)
+	}
+
+	db.Tx, err = db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Select("SELECT name FROM sqlite_temp_master WHERE type='table'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 0 {
+		t.Errorf("temporary tables left behind after rollback: %v", names)
+	}
+	if err := db.Disconnect(); err != nil {
+		t.Fatal(err)
 	}
 }

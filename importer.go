@@ -34,6 +34,9 @@ var (
 	ErrUnableConvert = errors.New("unable to convert")
 	// ErrNoMatchFound is returned if no match is found.
 	ErrNoMatchFound = errors.New("no match found")
+	// ErrBatchInput is returned if a file in a wildcard (batch)
+	// input cannot be opened or read.
+	ErrBatchInput = errors.New("batch input error")
 	// ErrNonDefinition is returned when there is no definition.
 	ErrNonDefinition = errors.New("no definition")
 	// ErrInvalidJSON is returned when the JSON is invalid.
@@ -221,21 +224,33 @@ func isSQLKeyWords(str string) bool {
 
 // ImportFile imports a file.
 // It returns the quoted table name and an error.
-// If the file is not found, it does not import and returns no error.
-// Wildcards can be passed as fileName.
+// If a single file is not found, it does not import and returns no error.
+// Wildcards can be passed as fileName: matched files are concatenated
+// in lexical order, but an error is returned if any matched file
+// cannot be opened or read.
 func ImportFile(db *DB, fileName string, readOpts *ReadOpts) (string, error) {
 	return ImportFileContext(context.Background(), db, fileName, readOpts)
 }
 
 // ImportFileContext imports a file with context.
 // It returns the quoted table name and an error.
-// If the file is not found, it does not import and returns no error.
-// Wildcards can be passed as fileName.
+// If a single file is not found, it does not import and returns no error.
+// Wildcards can be passed as fileName: matched files are concatenated
+// in lexical order, but an error is returned if any matched file
+// cannot be opened or read.
 func ImportFileContext(ctx context.Context, db *DB, fileName string, readOpts *ReadOpts) (string, error) {
 	opts, fileName := GuessOpts(readOpts, fileName)
 	db.importCount++
 	file, err := importFileOpen(fileName)
 	if err != nil {
+		if errors.Is(err, ErrBatchInput) {
+			// A wildcard matched files but one of them cannot be read:
+			// fail explicitly instead of producing partial results.
+			return "", err
+		}
+		// A single file that cannot be opened (e.g. not found) is
+		// ignored so it may be a table inside the database.
+		// A wildcard matching nothing behaves the same way.
 		debug.Printf("%s\n", err)
 		return "", nil
 	}
@@ -336,19 +351,34 @@ func importFileOpen(tableName string) (io.ReadCloser, error) {
 
 // uncompressedReader returns the decompressed reader
 // if it is a compressed file.
+// If a compressed stream is detected but cannot be decompressed,
+// it is treated as a normal stream (legacy behavior for single files).
 func uncompressedReader(reader io.Reader) io.ReadCloser {
-	var err error
-	buf := [7]byte{}
-	n, err := io.ReadAtLeast(reader, buf[:], len(buf))
+	r, _, err := compressedReader(reader)
 	if err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return io.NopCloser(bytes.NewReader(buf[:n]))
+		// r falls back to the raw stream.
+		return r
+	}
+	return r
+}
+
+// compressedReader detects compression by the magic number
+// and returns a decompressing reader.
+// It returns matched=false if the stream is not compressed.
+// It returns an error if a compression magic number is detected
+// but the decompressor cannot be initialized (corrupt header).
+// On error the returned reader is the raw stream for fallback use.
+func compressedReader(reader io.Reader) (r io.ReadCloser, matched bool, err error) {
+	buf := [7]byte{}
+	n, rerr := io.ReadAtLeast(reader, buf[:], len(buf))
+	if rerr != nil {
+		if errors.Is(rerr, io.EOF) || errors.Is(rerr, io.ErrUnexpectedEOF) {
+			return io.NopCloser(bytes.NewReader(buf[:n])), false, nil
 		}
-		return io.NopCloser(bytes.NewReader(nil))
+		return io.NopCloser(bytes.NewReader(nil)), false, nil
 	}
 
 	rd := io.MultiReader(bytes.NewReader(buf[:n]), reader)
-	var r io.ReadCloser
 	switch {
 	case bytes.Equal(buf[:3], []byte{0x1f, 0x8b, 0x8}):
 		r, err = gzip.NewReader(rd)
@@ -364,12 +394,14 @@ func uncompressedReader(reader io.Reader) io.ReadCloser {
 		var zr *xz.Reader
 		zr, err = xz.NewReader(rd)
 		r = io.NopCloser(zr)
+	default:
+		return io.NopCloser(rd), false, nil
 	}
 
-	if err != nil || r == nil {
-		r = io.NopCloser(rd)
+	if err != nil {
+		return io.NopCloser(rd), true, err
 	}
-	return r
+	return r, true, nil
 }
 
 // singleFileOpen opens one file. Also interpret stdin.
@@ -387,6 +419,12 @@ func singleFileOpen(fileName string) (io.ReadCloser, error) {
 
 // globFileOpen expands the file path,
 // connects multiple files and returns one io.PipeReader.
+// Matched file names are concatenated in lexical order.
+// If any matched file is not a regular file or cannot be opened,
+// an error wrapping ErrBatchInput is returned before streaming starts.
+// If a file cannot be read (including corrupt compressed content)
+// while streaming, the error is propagated to the reader,
+// naming the offending file, and the remaining files are not read.
 func globFileOpen(globName string) (*io.PipeReader, error) {
 	globName = expandTilde(trimQuote(globName))
 	fileNames, err := filepath.Glob(globName)
@@ -394,42 +432,76 @@ func globFileOpen(globName string) (*io.PipeReader, error) {
 		return nil, err
 	}
 	if len(fileNames) == 0 {
-		return nil, fmt.Errorf("%w: %s", ErrNoMatchFound, fileNames)
+		return nil, fmt.Errorf("%w: %s", ErrNoMatchFound, globName)
 	}
+
+	// Preflight: batch import fails if any matched file cannot be read.
+	for _, fileName := range fileNames {
+		if err := checkFileReadable(fileName); err != nil {
+			return nil, fmt.Errorf("%w: %s: %s", ErrBatchInput, fileName, err)
+		}
+	}
+
 	pipeReader, pipeWriter := io.Pipe()
 	go func() {
-		defer func() {
-			if err := pipeWriter.Close(); err != nil {
-				log.Printf("pipe close:%s", err)
-			}
-		}()
 		for _, fileName := range fileNames {
 			if err := copyFileOpen(pipeWriter, fileName); err != nil {
-				log.Printf("ERROR: %s:%s", fileName, err)
-				continue
+				// Stop the whole batch and report the offending file.
+				_ = pipeWriter.CloseWithError(
+					fmt.Errorf("%w: %s: %s", ErrBatchInput, fileName, err))
+				return
 			}
+		}
+		if err := pipeWriter.Close(); err != nil {
+			log.Printf("pipe close:%s", err)
 		}
 	}()
 	return pipeReader, nil
 }
 
+// checkFileReadable verifies that the matched file is a regular file
+// and can be opened for reading before the batch import starts.
+func checkFileReadable(fileName string) error {
+	info, err := os.Stat(fileName)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file (mode %s)", info.Mode())
+	}
+	file, err := os.Open(fileName)
+	if err != nil {
+		return err
+	}
+	return file.Close()
+}
+
 // copyFileOpen opens the file and copies it to the writer.
+// A corrupt compressed stream returns an error instead of
+// silently falling back to the raw content.
 func copyFileOpen(writer io.Writer, fileName string) error {
 	debug.Printf("Open: [%s]", fileName)
 	file, err := os.Open(fileName)
 	if err != nil {
 		return err
 	}
-	r := uncompressedReader(file)
+	defer func() {
+		if cerr := file.Close(); cerr != nil {
+			log.Printf("file close:%s", cerr)
+		}
+	}()
+
+	// Strict mode: a detected but unreadable compressed stream is an error.
+	r, _, err := compressedReader(file)
+	if err != nil {
+		return err
+	}
 
 	if _, err := io.Copy(writer, r); err != nil {
 		return err
 	}
 	// For if the file does not have a line break before EOF.
 	if _, err := writer.Write([]byte("\n")); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
 		return err
 	}
 	debug.Printf("Close: [%s]", fileName)

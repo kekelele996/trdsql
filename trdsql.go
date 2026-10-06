@@ -6,6 +6,8 @@ package trdsql
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 )
@@ -181,6 +183,18 @@ func (trd *TRDSQL) ExecContext(ctx context.Context, sqlQuery string) error {
 		return fmt.Errorf("begin: %w", err)
 	}
 
+	// Rollback on any failure to discard temporary data
+	// created during this import.
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		if rollbackErr := db.Tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			log.Printf("rollback: %s", rollbackErr)
+		}
+	}()
+
 	if trd.Importer != nil {
 		sqlQuery, err = trd.Importer.ImportContext(ctx, db, sqlQuery)
 		if err != nil {
@@ -198,5 +212,6 @@ func (trd *TRDSQL) ExecContext(ctx context.Context, sqlQuery string) error {
 		return fmt.Errorf("commit: %w", err)
 	}
 
+	committed = true
 	return nil
 }

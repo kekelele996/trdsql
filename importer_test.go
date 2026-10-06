@@ -1,10 +1,13 @@
 package trdsql
 
 import (
+	"bytes"
+	"compress/gzip"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -439,7 +442,10 @@ func Test_uncompressedReader(t *testing.T) {
 			if err != nil {
 				t.Fatalf("extFileReader() file open error %s:%s", tt.fileName, err)
 			}
-			got := uncompressedReader(file)
+			got, err := uncompressedReader(file)
+			if err != nil {
+				t.Fatalf("extFileReader() uncompressed error %s:%s", tt.fileName, err)
+			}
 			r, err := io.ReadAll(got)
 			if err != nil {
 				t.Fatalf("extFileReader() read error %s:%s", tt.fileName, err)
@@ -448,5 +454,158 @@ func Test_uncompressedReader(t *testing.T) {
 				t.Errorf("extFileReader() = %v, want %v", string(r)[0:7], tt.want[0:7])
 			}
 		})
+	}
+}
+
+// corruptGzipBytes returns a gzip stream with a valid header
+// that is truncated, so reading it to the end fails.
+func corruptGzipBytes(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte("1,Orange\n2,Melon\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b := buf.Bytes()
+	// Remove the trailer (CRC32 and size): header stays valid.
+	return b[:len(b)-8]
+}
+
+func TestImportFileGlobCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.csv"), []byte("1,Orange\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	badFile := filepath.Join(dir, "b.csv.gz")
+	if err := os.WriteFile(badFile, corruptGzipBytes(t), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	db := newDBTestSqlite3()
+	if db == nil {
+		t.Skip("sqlite3 is not available")
+	}
+	var err error
+	db.Tx, err = db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ImportFile(db, filepath.Join(dir, "*.csv*"), NewReadOpts())
+	if err == nil {
+		t.Fatal("expected an error for a glob containing a corrupt archive")
+	}
+	if !strings.Contains(err.Error(), badFile) {
+		t.Errorf("error should name the failing file %q: %v", badFile, err)
+	}
+	// The error surfaces during import after the table is created,
+	// so the quoted table name is returned together with the error.
+	if want := "`" + filepath.Join(dir, "*.csv*") + "`"; got != want {
+		t.Errorf("table name = %q, want %q", got, want)
+	}
+
+	if rollbackErr := db.Tx.Rollback(); rollbackErr != nil {
+		t.Fatal(rollbackErr)
+	}
+	if disconnectErr := db.Disconnect(); disconnectErr != nil {
+		t.Fatal(disconnectErr)
+	}
+}
+
+func TestImportFileGlobPermission(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permissions")
+	}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.csv"), []byte("1,Orange\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	badFile := filepath.Join(dir, "b.csv")
+	if err := os.WriteFile(badFile, []byte("2,Melon\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(badFile, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(badFile, 0o644) })
+
+	db := newDBTestSqlite3()
+	if db == nil {
+		t.Skip("sqlite3 is not available")
+	}
+	var err error
+	db.Tx, err = db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = ImportFile(db, filepath.Join(dir, "*.csv"), NewReadOpts())
+	if err == nil {
+		t.Fatal("expected an error for a glob containing an unreadable file")
+	}
+	if !strings.Contains(err.Error(), badFile) {
+		t.Errorf("error should name the failing file %q: %v", badFile, err)
+	}
+
+	if rollbackErr := db.Tx.Rollback(); rollbackErr != nil {
+		t.Fatal(rollbackErr)
+	}
+	if disconnectErr := db.Disconnect(); disconnectErr != nil {
+		t.Fatal(disconnectErr)
+	}
+}
+
+// TestTRDSQLGlobErrorNoOutput verifies end-to-end that a read error
+// on one file fails the query, names the file, and emits no output.
+func TestTRDSQLGlobErrorNoOutput(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.csv"), []byte("1,Orange\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	badFile := filepath.Join(dir, "b.csv.gz")
+	if err := os.WriteFile(badFile, corruptGzipBytes(t), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out := new(bytes.Buffer)
+	trd := setDefaultTRDSQL(out)
+	err := trd.Exec("SELECT * FROM " + filepath.Join(dir, "*.csv*"))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), badFile) {
+		t.Errorf("error should name the failing file %q: %v", badFile, err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("no output expected on failure, got %q", out.String())
+	}
+}
+
+// TestTRDSQLStdin verifies that reading from stdin still works.
+func TestTRDSQLStdin(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = oldStdin })
+
+	go func() {
+		_, _ = w.Write([]byte("1,Orange\n"))
+		_ = w.Close()
+	}()
+
+	out := new(bytes.Buffer)
+	trd := setDefaultTRDSQL(out)
+	if err := trd.Exec("SELECT * FROM -"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := out.String(), "1,Orange\n"; got != want {
+		t.Errorf("stdin result = %q, want %q", got, want)
 	}
 }

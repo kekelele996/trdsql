@@ -221,7 +221,10 @@ func isSQLKeyWords(str string) bool {
 
 // ImportFile imports a file.
 // It returns the quoted table name and an error.
-// If the file is not found, it does not import and returns no error.
+// If the file is not found, it does not import and returns no error,
+// because the name may be a database table or table-valued function.
+// Other errors (such as permission failure) return an error
+// that includes the file name.
 // Wildcards can be passed as fileName.
 func ImportFile(db *DB, fileName string, readOpts *ReadOpts) (string, error) {
 	return ImportFileContext(context.Background(), db, fileName, readOpts)
@@ -229,15 +232,23 @@ func ImportFile(db *DB, fileName string, readOpts *ReadOpts) (string, error) {
 
 // ImportFileContext imports a file with context.
 // It returns the quoted table name and an error.
-// If the file is not found, it does not import and returns no error.
+// If the file is not found, it does not import and returns no error,
+// because the name may be a database table or table-valued function.
+// Other errors (such as permission failure) return an error
+// that includes the file name.
 // Wildcards can be passed as fileName.
 func ImportFileContext(ctx context.Context, db *DB, fileName string, readOpts *ReadOpts) (string, error) {
 	opts, fileName := GuessOpts(readOpts, fileName)
 	db.importCount++
 	file, err := importFileOpen(fileName)
 	if err != nil {
-		debug.Printf("%s\n", err)
-		return "", nil
+		// A name that does not exist as a file is left unchanged,
+		// assuming a database table or table-valued function.
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, ErrNoMatchFound) {
+			debug.Printf("%s\n", err)
+			return "", nil
+		}
+		return "", fmt.Errorf("%s: %w", fileName, err)
 	}
 
 	defer func() {
@@ -336,15 +347,17 @@ func importFileOpen(tableName string) (io.ReadCloser, error) {
 
 // uncompressedReader returns the decompressed reader
 // if it is a compressed file.
-func uncompressedReader(reader io.Reader) io.ReadCloser {
-	var err error
+// If the content has a compression magic number but the
+// decoder cannot process it, an error is returned, because
+// the archive is considered corrupt.
+func uncompressedReader(reader io.Reader) (io.ReadCloser, error) {
 	buf := [7]byte{}
 	n, err := io.ReadAtLeast(reader, buf[:], len(buf))
 	if err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return io.NopCloser(bytes.NewReader(buf[:n]))
+			return io.NopCloser(bytes.NewReader(buf[:n])), nil
 		}
-		return io.NopCloser(bytes.NewReader(nil))
+		return io.NopCloser(bytes.NewReader(nil)), err
 	}
 
 	rd := io.MultiReader(bytes.NewReader(buf[:n]), reader)
@@ -366,27 +379,34 @@ func uncompressedReader(reader io.Reader) io.ReadCloser {
 		r = io.NopCloser(zr)
 	}
 
-	if err != nil || r == nil {
+	if err != nil {
+		// The magic number indicates a compressed file,
+		// but the decoder failed: the archive is corrupt.
+		return nil, err
+	}
+	if r == nil {
 		r = io.NopCloser(rd)
 	}
-	return r
+	return r, nil
 }
 
 // singleFileOpen opens one file. Also interpret stdin.
 func singleFileOpen(fileName string) (io.ReadCloser, error) {
 	if len(fileName) == 0 || fileName == "-" || strings.ToLower(fileName) == "stdin" {
-		return uncompressedReader(bufio.NewReader(os.Stdin)), nil
+		return uncompressedReader(bufio.NewReader(os.Stdin))
 	}
 	fileName = expandTilde(trimQuote(fileName))
 	file, err := os.Open(fileName)
 	if err != nil {
 		return nil, err
 	}
-	return uncompressedReader(file), nil
+	return uncompressedReader(file)
 }
 
 // globFileOpen expands the file path,
 // connects multiple files and returns one io.PipeReader.
+// If any matched file cannot be opened or read, the entire
+// query fails with an error that includes the file name.
 func globFileOpen(globName string) (*io.PipeReader, error) {
 	globName = expandTilde(trimQuote(globName))
 	fileNames, err := filepath.Glob(globName)
@@ -394,20 +414,20 @@ func globFileOpen(globName string) (*io.PipeReader, error) {
 		return nil, err
 	}
 	if len(fileNames) == 0 {
-		return nil, fmt.Errorf("%w: %s", ErrNoMatchFound, fileNames)
+		return nil, fmt.Errorf("%w: %s", ErrNoMatchFound, globName)
 	}
 	pipeReader, pipeWriter := io.Pipe()
 	go func() {
-		defer func() {
-			if err := pipeWriter.Close(); err != nil {
-				log.Printf("pipe close:%s", err)
-			}
-		}()
 		for _, fileName := range fileNames {
 			if err := copyFileOpen(pipeWriter, fileName); err != nil {
-				log.Printf("ERROR: %s:%s", fileName, err)
-				continue
+				// Propagate the error to the reader side,
+				// including the name of the failing file.
+				_ = pipeWriter.CloseWithError(fmt.Errorf("%s: %w", fileName, err))
+				return
 			}
+		}
+		if err := pipeWriter.Close(); err != nil {
+			log.Printf("pipe close:%s", err)
 		}
 	}()
 	return pipeReader, nil
@@ -420,16 +440,21 @@ func copyFileOpen(writer io.Writer, fileName string) error {
 	if err != nil {
 		return err
 	}
-	r := uncompressedReader(file)
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			log.Printf("file close:%s", closeErr)
+		}
+	}()
+	r, err := uncompressedReader(file)
+	if err != nil {
+		return err
+	}
 
 	if _, err := io.Copy(writer, r); err != nil {
 		return err
 	}
 	// For if the file does not have a line break before EOF.
 	if _, err := writer.Write([]byte("\n")); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
 		return err
 	}
 	debug.Printf("Close: [%s]", fileName)

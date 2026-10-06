@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -263,6 +264,17 @@ func (cli Cli) Run(args []string) int {
 		}
 	}
 
+	// removeOutFile removes the prepared output file on failure,
+	// so that no incomplete report is left behind.
+	removeOutFile := func() {
+		if outFile == "" {
+			return
+		}
+		if removeErr := os.Remove(outFile); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			log.Printf("%s", removeErr)
+		}
+	}
+
 	outFormat := outputFormat(outFlag)
 	if outFormat == trdsql.GUESS {
 		if outWithoutGuess {
@@ -279,6 +291,7 @@ func (cli Cli) Run(args []string) int {
 	writer, err = compressionWriter(writer, outCompression)
 	if err != nil {
 		log.Printf("%s", err)
+		removeOutFile()
 		return 1
 	}
 
@@ -310,6 +323,7 @@ func (cli Cli) Run(args []string) int {
 
 	if err = trd.ExecContext(ctx, query); err != nil {
 		log.Printf("%s", err)
+		removeOutFile()
 		return 1
 	}
 
@@ -317,6 +331,7 @@ func (cli Cli) Run(args []string) int {
 		err = wc.Close()
 		if err != nil {
 			log.Printf("%s", err)
+			removeOutFile()
 			return 1
 		}
 	}

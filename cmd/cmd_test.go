@@ -2,10 +2,13 @@ package cmd
 
 import (
 	"bytes"
+	"compress/gzip"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/noborus/trdsql"
@@ -752,5 +755,89 @@ func Test_guessCompression(t *testing.T) {
 				t.Errorf("guessCompression() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCli_Run_OutCleanup(t *testing.T) {
+	tests := []struct {
+		name      string
+		setup     func(t *testing.T) (string, string) // returns query and bad file name
+	}{
+		{
+			name: "missingFile",
+			setup: func(t *testing.T) (string, string) {
+				missing := filepath.Join(t.TempDir(), "missing.csv")
+				return "SELECT * FROM " + missing, missing
+			},
+		},
+		{
+			name: "corruptArchive",
+			setup: func(t *testing.T) (string, string) {
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, "a.csv"), []byte("1,Orange\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				bad := filepath.Join(dir, "b.csv.gz")
+				var buf bytes.Buffer
+				zw := gzip.NewWriter(&buf)
+				if _, err := zw.Write([]byte("2,Melon\n")); err != nil {
+					t.Fatal(err)
+				}
+				if err := zw.Close(); err != nil {
+					t.Fatal(err)
+				}
+				gz := buf.Bytes()
+				if err := os.WriteFile(bad, gz[:len(gz)-8], 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return "SELECT * FROM " + filepath.Join(dir, "*.csv*"), bad
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			query, badFile := tt.setup(t)
+			outFile := filepath.Join(t.TempDir(), "result.csv")
+
+			outStream, errStream := new(bytes.Buffer), new(bytes.Buffer)
+			cli := Cli{
+				OutStream: outStream,
+				ErrStream: errStream,
+			}
+			var logBuf bytes.Buffer
+			log.SetOutput(&logBuf)
+
+			if got := cli.Run([]string{"trdsql", "-out", outFile, query}); got != 1 {
+				t.Fatalf("Run() = %d, want 1; err: %s", got, errStream.String())
+			}
+			if _, err := os.Stat(outFile); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("prepared output file should have been removed: %v", err)
+			}
+			if !strings.Contains(errStream.String(), badFile) {
+				t.Errorf("error should name the failing file %q: %s", badFile, errStream.String())
+			}
+		})
+	}
+}
+
+// TestCli_Run_OutKeptOnSuccess verifies that a successful run
+// leaves the output file in place.
+func TestCli_Run_OutKeptOnSuccess(t *testing.T) {
+	outFile := filepath.Join(t.TempDir(), "result.csv")
+	query := "SELECT * FROM " + filepath.Join("..", "testdata", "test.csv")
+
+	outStream, errStream := new(bytes.Buffer), new(bytes.Buffer)
+	cli := Cli{
+		OutStream: outStream,
+		ErrStream: errStream,
+	}
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+
+	if got := cli.Run([]string{"trdsql", "-out", outFile, query}); got != 0 {
+		t.Fatalf("Run() = %d, want 0; log: %s", got, logBuf.String())
+	}
+	if _, err := os.Stat(outFile); err != nil {
+		t.Fatalf("output file should exist after success: %v", err)
 	}
 }
